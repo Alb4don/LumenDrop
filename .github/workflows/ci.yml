@@ -1,0 +1,124 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  lint-and-syntax:
+    name: Lint and syntax check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install ruff
+        run: pip install ruff
+
+      - name: Parse for syntax errors
+        run: python -c "import ast; ast.parse(open('lumendrop.py', encoding='utf-8').read())"
+
+      - name: Ruff check (correctness rules only)
+        run: ruff check lumendrop.py --select=E9,F --output-format=github
+
+  server-smoke-test:
+    name: Headless server smoke test
+    needs: lint-and-syntax
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+        python-version: ["3.10", "3.11", "3.12"]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install dependencies
+        run: pip install fastapi uvicorn python-multipart qrcode pillow itsdangerous ttkbootstrap
+
+      - name: Start server and verify it responds
+        shell: python
+        run: |
+          import subprocess, sys, time, tempfile, urllib.request
+
+          folder = tempfile.mkdtemp()
+          proc = subprocess.Popen(
+              [sys.executable, "lumendrop.py", folder, "--no-gui", "--allow-root", "--port", "8420"],
+              stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+          )
+          try:
+              deadline = time.time() + 20
+              pin = None
+              while time.time() < deadline:
+                  line = proc.stdout.readline()
+                  if not line:
+                      if proc.poll() is not None:
+                          break
+                      continue
+                  print(line, end="")
+                  if line.startswith("PIN:"):
+                      pin = line.split(":", 1)[1].strip()
+                      break
+              if pin is None:
+                  print("Server did not print a PIN in time", file=sys.stderr)
+                  sys.exit(1)
+
+              time.sleep(1)
+              resp = urllib.request.urlopen("http://127.0.0.1:8420/login", timeout=5)
+              if resp.status != 200:
+                  print(f"Unexpected status for /login: {resp.status}", file=sys.stderr)
+                  sys.exit(1)
+
+              resp2 = urllib.request.urlopen("http://127.0.0.1:8420/assets/app.css", timeout=5)
+              if resp2.status != 200:
+                  print(f"Unexpected status for /assets/app.css: {resp2.status}", file=sys.stderr)
+                  sys.exit(1)
+
+              print("Smoke test passed: login page and static assets reachable")
+          finally:
+              proc.terminate()
+              try:
+                  proc.wait(timeout=5)
+              except subprocess.TimeoutExpired:
+                  proc.kill()
+
+  gui-smoke-test:
+    name: Desktop GUI build smoke test (Linux)
+    needs: lint-and-syntax
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install system Tk and Xvfb
+        run: sudo apt-get update && sudo apt-get install -y python3-tk xvfb
+
+      - name: Install dependencies
+        run: pip install fastapi uvicorn python-multipart qrcode pillow itsdangerous ttkbootstrap
+
+      - name: Build the GUI under a virtual display
+        run: |
+          mkdir -p /tmp/lumendrop-gui-test
+          set +e
+          timeout 15 xvfb-run -a python3 lumendrop.py /tmp/lumendrop-gui-test --port 8421 --allow-root > gui_output.log 2>&1
+          code=$?
+          set -e
+          cat gui_output.log
+          if [ "$code" -ne 124 ]; then
+            echo "GUI exited early with code $code instead of running until timeout"
+            exit 1
+          fi
+          echo "GUI built and ran without raising an exception"
