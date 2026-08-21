@@ -1,0 +1,39 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Verify syntax before releasing
+        run: python -c "import ast; ast.parse(open('lumendrop.py', encoding='utf-8').read())"
+
+      - name: Verify tag matches APP_VERSION in the script
+        run: |
+          tag_version="${GITHUB_REF_NAME#v}"
+          script_version=$(python -c "import re; print(re.search(r'APP_VERSION = \"([^\"]+)\"', open('lumendrop.py').read()).group(1))")
+          if [ "$tag_version" != "$script_version" ]; then
+            echo "Tag is v$tag_version but lumendrop.py APP_VERSION is $script_version"
+            exit 1
+          fi
+
+      - name: Create GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: LumenDrop ${{ github.ref_name }}
+          generate_release_notes: true
+          files: |
+            lumendrop.py
