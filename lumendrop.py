@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import ctypes
+import datetime
 import hashlib
 import html
 import ipaddress
@@ -13,7 +14,9 @@ import os
 import queue
 import re
 import secrets
+import shutil
 import socket
+import sqlite3
 import sys
 import threading
 import time
@@ -28,10 +31,22 @@ import uvicorn
 from fastapi import Depends, FastAPI, File, Form, Request, UploadFile
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
 from itsdangerous import BadSignature, URLSafeTimedSerializer
+from pydantic import BaseModel, Field
 from starlette.middleware.base import BaseHTTPMiddleware
 
+try:
+    from cryptography import x509
+    from cryptography.hazmat.primitives import hashes as crypto_hashes
+    from cryptography.hazmat.primitives import serialization
+    from cryptography.hazmat.primitives.asymmetric import rsa
+    from cryptography.x509.oid import NameOID
+
+    CRYPTOGRAPHY_AVAILABLE = True
+except ImportError:
+    CRYPTOGRAPHY_AVAILABLE = False
+
 APP_NAME = "LumenDrop"
-APP_VERSION = "1.0.0"
+APP_VERSION = "1.1.0"
 DEFAULT_PORT = 8420
 SESSION_COOKIE = "lumendrop_session"
 LANG_COOKIE = "lumendrop_lang"
@@ -45,6 +60,19 @@ LOGIN_LOCKOUT_SECONDS = 900
 GLOBAL_RATE_LIMIT_PER_MIN = 240
 THREAT_BAN_SECONDS = 1800
 THREAT_SCORE_BAN_THRESHOLD = 6
+BAN_ESCALATION_MULTIPLIERS = (1, 4, 48)
+TRUSTED_REPUTATION_MARGIN = 2
+CUMULATIVE_THREAT_WINDOW_SECONDS = 300
+CUMULATIVE_THREAT_THRESHOLD = 10
+SECURITY_EVENT_RETENTION_DAYS = 30
+
+RESUMABLE_MIN_CHUNK_SIZE = 256 * 1024
+RESUMABLE_MAX_CHUNK_SIZE = 64 * 1024 * 1024
+RESUMABLE_DEFAULT_CHUNK_SIZE = 4 * 1024 * 1024
+UPLOAD_SESSION_TTL_SECONDS = 60 * 60 * 24
+STAGING_DIR_NAME = ".lumendrop_staging"
+
+CERT_VALIDITY_DAYS = 397
 
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".gif", ".webp", ".heic", ".bmp", ".svg", ".avif"}
 EXECUTABLE_EXTENSIONS = {
@@ -62,6 +90,7 @@ PATH_TRAVERSAL_PATTERN = re.compile(r"(\.\.[/\\])|(%2e%2e)|(%00)|(\x00)", re.IGN
 SCRIPT_INJECTION_PATTERN = re.compile(
     r"(<\s*script)|(javascript:)|(on\w+\s*=)|(union\s+select)|(select\s+.+\s+from)|(--\s*$)",
     re.IGNORECASE,
+
 )
 
 STRINGS = {
@@ -92,6 +121,7 @@ STRINGS = {
         "rate_limited": "Too many requests. Please slow down.",
         "file_too_large": "File exceeds the maximum allowed size.",
         "invalid_filename": "Invalid file name.",
+        "invalid_request": "The request is invalid.",
     },
     "pt": {
         "page_title": "LumenDrop",
@@ -120,6 +150,7 @@ STRINGS = {
         "rate_limited": "Muitas solicita\u00e7\u00f5es. Diminua o ritmo.",
         "file_too_large": "O arquivo excede o tamanho m\u00e1ximo permitido.",
         "invalid_filename": "Nome de arquivo inv\u00e1lido.",
+        "invalid_request": "A solicita\u00e7\u00e3o \u00e9 inv\u00e1lida.",
     },
 }
 
@@ -141,6 +172,8 @@ GUI_STRINGS = {
         "status_starting": "Starting\u2026",
         "status_stopping": "Stopping\u2026",
         "qr_hint": "Scan this QR code from any device on the same network",
+        "fingerprint_label": "TLS fingerprint",
+        "https_unavailable": "HTTPS unavailable (cryptography package missing or cert generation failed). Serving over plain HTTP.",
         "language_label": "Language",
         "root_warning": "Running with administrator/root privileges is not recommended. Restart without elevated privileges, or pass --allow-root if you fully understand the risk.",
         "security_events_heading": "Recent security events",
@@ -176,6 +209,8 @@ GUI_STRINGS = {
         "status_starting": "Iniciando\u2026",
         "status_stopping": "Parando\u2026",
         "qr_hint": "Escaneie este QR code em qualquer dispositivo na mesma rede",
+        "fingerprint_label": "Impressão digital TLS",
+        "https_unavailable": "HTTPS indisponível (pacote cryptography ausente ou falha ao gerar o certificado). Servindo via HTTP simples.",
         "language_label": "Idioma",
         "root_warning": "N\u00e3o \u00e9 recomendado executar como administrador/root. Reinicie sem privil\u00e9gios elevados ou use --allow-root se voc\u00ea entende os riscos.",
         "security_events_heading": "Eventos de seguran\u00e7a recentes",
@@ -405,11 +440,13 @@ class SecurityEventBus:
 
 
 class BanStore:
-    def __init__(self, event_bus: SecurityEventBus, logger: logging.Logger):
+    def __init__(self, event_bus: SecurityEventBus, logger: logging.Logger, persistent_store: "PersistentSecurityStore"):
         self._banned_until: dict[str, float] = {}
         self._lock = threading.Lock()
         self._event_bus = event_bus
         self._logger = logger
+        self._persistent_store = persistent_store
+        self._banned_until.update(persistent_store.load_active_bans())
 
     def is_banned(self, ip: str) -> bool:
         with self._lock:
@@ -422,9 +459,18 @@ class BanStore:
             return True
 
     def ban(self, ip: str, reason: str, score: int, seconds: int = THREAT_BAN_SECONDS) -> None:
+        prior_offenses = self._persistent_store.offense_count(ip)
+        multiplier_index = min(prior_offenses, len(BAN_ESCALATION_MULTIPLIERS) - 1)
+        effective_seconds = seconds * BAN_ESCALATION_MULTIPLIERS[multiplier_index]
+        until = time.time() + effective_seconds
         with self._lock:
-            self._banned_until[ip] = time.time() + seconds
-        self._logger.warning("Blocking address %s for %ss (%s, score=%s)", ip, seconds, reason, score)
+            self._banned_until[ip] = until
+        self._persistent_store.record_event(ip, reason, score)
+        self._persistent_store.record_ban(ip, reason, score, until, prior_offenses + 1)
+        self._logger.warning(
+            "Blocking address %s for %ss (%s, score=%s, offense #%s)",
+            ip, effective_seconds, reason, score, prior_offenses + 1,
+        )
         self._event_bus.publish(SecurityEvent(time.time(), ip, reason, score))
 
     def snapshot(self) -> dict[str, float]:
@@ -452,31 +498,17 @@ class SlidingWindowLimiter:
 
 
 class LoginAttemptTracker:
-    def __init__(self):
-        self._failures: dict[str, deque[float]] = {}
-        self._lock = threading.Lock()
+    def __init__(self, persistent_store: "PersistentSecurityStore"):
+        self._persistent_store = persistent_store
 
     def register_failure(self, ip: str) -> int:
-        now = time.time()
-        with self._lock:
-            bucket = self._failures.setdefault(ip, deque())
-            bucket.append(now)
-            while bucket and now - bucket[0] > LOGIN_LOCKOUT_SECONDS:
-                bucket.popleft()
-            return len(bucket)
+        return self._persistent_store.record_login_failure(ip)
 
     def clear(self, ip: str) -> None:
-        with self._lock:
-            self._failures.pop(ip, None)
+        self._persistent_store.record_login_success(ip)
 
     def seconds_until_unlocked(self, ip: str) -> int:
-        with self._lock:
-            bucket = self._failures.get(ip)
-            if not bucket or len(bucket) < MAX_LOGIN_ATTEMPTS:
-                return 0
-            oldest_relevant = bucket[-MAX_LOGIN_ATTEMPTS]
-            remaining = LOGIN_LOCKOUT_SECONDS - (time.time() - oldest_relevant)
-            return max(0, int(remaining))
+        return self._persistent_store.seconds_until_login_unlocked(ip)
 
 
 class SessionManager:
@@ -534,6 +566,255 @@ class MetadataStore:
             data = self._read()
             data.pop(filename, None)
             self._write(data)
+
+
+class PersistentSecurityStore:
+    def __init__(self, db_path: Path):
+        self.db_path = db_path
+        self._lock = threading.Lock()
+        self._conn = sqlite3.connect(str(db_path), check_same_thread=False)
+        self._conn.execute("PRAGMA journal_mode=WAL")
+        self._init_schema()
+        self.prune_old()
+
+    def _init_schema(self) -> None:
+        with self._lock:
+            self._conn.executescript(
+                """
+                CREATE TABLE IF NOT EXISTS security_events (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    ts REAL NOT NULL,
+                    ip TEXT NOT NULL,
+                    reason TEXT NOT NULL,
+                    score INTEGER NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_events_ip_ts ON security_events(ip, ts);
+
+                CREATE TABLE IF NOT EXISTS bans (
+                    ip TEXT PRIMARY KEY,
+                    banned_until REAL NOT NULL,
+                    reason TEXT NOT NULL,
+                    score INTEGER NOT NULL,
+                    offense_count INTEGER NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS ip_reputation (
+                    ip TEXT PRIMARY KEY,
+                    successful_logins INTEGER NOT NULL DEFAULT 0,
+                    violation_count INTEGER NOT NULL DEFAULT 0,
+                    first_seen REAL NOT NULL,
+                    last_seen REAL NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS login_failures (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    ip TEXT NOT NULL,
+                    ts REAL NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_login_failures_ip_ts ON login_failures(ip, ts);
+                """
+            )
+            self._conn.commit()
+
+    def _touch_reputation(self, ip: str) -> None:
+        now = time.time()
+        self._conn.execute(
+            "INSERT INTO ip_reputation (ip, successful_logins, violation_count, first_seen, last_seen) "
+            "VALUES (?, 0, 0, ?, ?) ON CONFLICT(ip) DO UPDATE SET last_seen = excluded.last_seen",
+            (ip, now, now),
+        )
+
+    def record_event(self, ip: str, reason: str, score: int) -> None:
+        with self._lock:
+            self._touch_reputation(ip)
+            self._conn.execute(
+                "INSERT INTO security_events (ts, ip, reason, score) VALUES (?, ?, ?, ?)",
+                (time.time(), ip, reason, score),
+            )
+            self._conn.execute(
+                "UPDATE ip_reputation SET violation_count = violation_count + 1 WHERE ip = ?", (ip,)
+            )
+            self._conn.commit()
+
+    def record_ban(self, ip: str, reason: str, score: int, until: float, offense_count: int) -> None:
+        with self._lock:
+            self._conn.execute(
+                "INSERT INTO bans (ip, banned_until, reason, score, offense_count) VALUES (?, ?, ?, ?, ?) "
+                "ON CONFLICT(ip) DO UPDATE SET banned_until = excluded.banned_until, "
+                "reason = excluded.reason, score = excluded.score, offense_count = excluded.offense_count",
+                (ip, until, reason, score, offense_count),
+            )
+            self._conn.commit()
+
+    def load_active_bans(self) -> dict:
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT ip, banned_until FROM bans WHERE banned_until > ?", (time.time(),)
+            ).fetchall()
+            return {ip: until for ip, until in rows}
+
+    def offense_count(self, ip: str) -> int:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT violation_count FROM ip_reputation WHERE ip = ?", (ip,)
+            ).fetchone()
+            return int(row[0]) if row else 0
+
+    def is_trusted(self, ip: str) -> bool:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT successful_logins, violation_count FROM ip_reputation WHERE ip = ?", (ip,)
+            ).fetchone()
+            if row is None:
+                return False
+            successful_logins, violation_count = row
+            return successful_logins > 0 and violation_count == 0
+
+    def record_login_success(self, ip: str) -> None:
+        with self._lock:
+            self._touch_reputation(ip)
+            self._conn.execute(
+                "UPDATE ip_reputation SET successful_logins = successful_logins + 1 WHERE ip = ?", (ip,)
+            )
+            self._conn.execute("DELETE FROM login_failures WHERE ip = ?", (ip,))
+            self._conn.commit()
+
+    def record_login_failure(self, ip: str) -> int:
+        with self._lock:
+            now = time.time()
+            self._touch_reputation(ip)
+            self._conn.execute("INSERT INTO login_failures (ip, ts) VALUES (?, ?)", (ip, now))
+            self._conn.execute(
+                "UPDATE ip_reputation SET violation_count = violation_count + 1 WHERE ip = ?", (ip,)
+            )
+            self._conn.commit()
+            cutoff = now - LOGIN_LOCKOUT_SECONDS
+            row = self._conn.execute(
+                "SELECT COUNT(*) FROM login_failures WHERE ip = ? AND ts > ?", (ip, cutoff)
+            ).fetchone()
+            return int(row[0])
+
+    def seconds_until_login_unlocked(self, ip: str) -> int:
+        with self._lock:
+            now = time.time()
+            cutoff = now - LOGIN_LOCKOUT_SECONDS
+            rows = self._conn.execute(
+                "SELECT ts FROM login_failures WHERE ip = ? AND ts > ? ORDER BY ts", (ip, cutoff)
+            ).fetchall()
+            if len(rows) < MAX_LOGIN_ATTEMPTS:
+                return 0
+            oldest_relevant_ts = rows[-MAX_LOGIN_ATTEMPTS][0]
+            remaining = LOGIN_LOCKOUT_SECONDS - (now - oldest_relevant_ts)
+            return max(0, int(remaining))
+
+    def cumulative_score(self, ip: str, window_seconds: int) -> int:
+        with self._lock:
+            cutoff = time.time() - window_seconds
+            row = self._conn.execute(
+                "SELECT COALESCE(SUM(score), 0) FROM security_events WHERE ip = ? AND ts > ?", (ip, cutoff)
+            ).fetchone()
+            return int(row[0])
+
+    def prune_old(self, retention_days: int = SECURITY_EVENT_RETENTION_DAYS) -> None:
+        with self._lock:
+            cutoff = time.time() - retention_days * 86400
+            self._conn.execute("DELETE FROM security_events WHERE ts < ?", (cutoff,))
+            self._conn.execute("DELETE FROM bans WHERE banned_until < ?", (cutoff,))
+            self._conn.execute("DELETE FROM login_failures WHERE ts < ?", (cutoff,))
+            self._conn.commit()
+
+    def close(self) -> None:
+        with self._lock:
+            self._conn.close()
+
+
+class UploadSessionStore:
+    def __init__(self, upload_dir: Path):
+        self.staging_root = upload_dir / STAGING_DIR_NAME
+        self.staging_root.mkdir(parents=True, exist_ok=True)
+        self._lock = threading.Lock()
+
+    def _session_dir(self, upload_id: str) -> Path:
+        return self.staging_root / upload_id
+
+    def _meta_path(self, upload_id: str) -> Path:
+        return self._session_dir(upload_id) / "meta.json"
+
+    def _chunks_dir(self, upload_id: str) -> Path:
+        return self._session_dir(upload_id) / "chunks"
+
+    def _read_meta(self, upload_id: str) -> Optional[dict]:
+        path = self._meta_path(upload_id)
+        if not path.exists():
+            return None
+        try:
+            return json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return None
+
+    def _write_meta(self, upload_id: str, meta: dict) -> None:
+        path = self._meta_path(upload_id)
+        tmp = path.with_suffix(".tmp")
+        tmp.write_text(json.dumps(meta), encoding="utf-8")
+        tmp.replace(path)
+
+    def sweep_expired(self) -> None:
+        with self._lock:
+            if not self.staging_root.exists():
+                return
+            now = time.time()
+            for entry in self.staging_root.iterdir():
+                if not entry.is_dir():
+                    continue
+                meta = self._read_meta(entry.name)
+                created_at = meta.get("created_at", 0) if meta else 0
+                if meta is None or now - created_at > UPLOAD_SESSION_TTL_SECONDS:
+                    shutil.rmtree(entry, ignore_errors=True)
+
+    def create_session(self, filename: str, total_size: int, chunk_size: int) -> dict:
+        upload_id = secrets.token_urlsafe(24)
+        total_chunks = max(1, -(-total_size // chunk_size))
+        meta = {
+            "upload_id": upload_id,
+            "filename": filename,
+            "total_size": total_size,
+            "chunk_size": chunk_size,
+            "total_chunks": total_chunks,
+            "received": [],
+            "created_at": time.time(),
+        }
+        with self._lock:
+            (self._session_dir(upload_id) / "chunks").mkdir(parents=True, exist_ok=True)
+            self._write_meta(upload_id, meta)
+        return meta
+
+    def get_session(self, upload_id: str) -> Optional[dict]:
+        with self._lock:
+            meta = self._read_meta(upload_id)
+            if meta is None:
+                return None
+            if time.time() - meta.get("created_at", 0) > UPLOAD_SESSION_TTL_SECONDS:
+                shutil.rmtree(self._session_dir(upload_id), ignore_errors=True)
+                return None
+            return meta
+
+    def chunk_path(self, upload_id: str, chunk_index: int) -> Path:
+        return self._chunks_dir(upload_id) / f"{chunk_index:08d}.part"
+
+    def mark_received(self, upload_id: str, chunk_index: int) -> Optional[dict]:
+        with self._lock:
+            meta = self._read_meta(upload_id)
+            if meta is None:
+                return None
+            received = set(meta["received"])
+            received.add(chunk_index)
+            meta["received"] = sorted(received)
+            self._write_meta(upload_id, meta)
+            return meta
+
+    def discard(self, upload_id: str) -> None:
+        with self._lock:
+            shutil.rmtree(self._session_dir(upload_id), ignore_errors=True)
 
 
 APP_CSS = """
@@ -595,43 +876,134 @@ function preventPageNavigation() {
   });
 }
 
-function humanState(pct) {
-  return pct >= 100 ? 'done' : 'uploading';
+var LUMENDROP_CHUNK_SIZE = 4 * 1024 * 1024;
+
+function lumendropStorageKey(file) {
+  return 'lumendrop_upload::' + file.name + '::' + file.size + '::' + (file.lastModified || 0);
 }
 
-function uploadOne(file, container, labels) {
-  return new Promise(function (resolve) {
-    var row = document.createElement('div');
-    row.className = 'upload-row';
-    var label = document.createElement('span');
-    label.textContent = file.name;
-    var bar = document.createElement('progress');
-    bar.max = 100; bar.value = 0;
-    var pct = document.createElement('span');
-    pct.textContent = '0%';
-    row.appendChild(label); row.appendChild(bar); row.appendChild(pct);
-    container.appendChild(row);
+function lumendropGetSavedId(file) {
+  try {
+    return window.localStorage.getItem(lumendropStorageKey(file));
+  } catch (e) {
+    return null;
+  }
+}
 
+function lumendropSaveId(file, uploadId) {
+  try {
+    window.localStorage.setItem(lumendropStorageKey(file), uploadId);
+  } catch (e) {}
+}
+
+function lumendropClearId(file) {
+  try {
+    window.localStorage.removeItem(lumendropStorageKey(file));
+  } catch (e) {}
+}
+
+function postJSON(url, body) {
+  return fetch(url, {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json', 'X-Requested-With': 'LumenDropClient'},
+    body: JSON.stringify(body)
+  }).then(function (r) {
+    if (!r.ok) throw new Error('request_failed');
+    return r.json();
+  });
+}
+
+function getJSON(url) {
+  return fetch(url, {headers: {'X-Requested-With': 'LumenDropClient'}}).then(function (r) {
+    if (!r.ok) throw new Error('not_found');
+    return r.json();
+  });
+}
+
+function uploadChunkXhr(uploadId, index, blob) {
+  return new Promise(function (resolve, reject) {
     var xhr = new XMLHttpRequest();
     var fd = new FormData();
-    fd.append('files', file, file.name);
-    xhr.upload.addEventListener('progress', function (e) {
-      if (!e.lengthComputable) return;
-      var value = Math.round((e.loaded / e.total) * 100);
-      bar.value = value;
-      pct.textContent = value + '%';
-    });
+    fd.append('upload_id', uploadId);
+    fd.append('chunk_index', String(index));
+    fd.append('chunk', blob, 'chunk');
     xhr.addEventListener('load', function () {
-      pct.textContent = xhr.status >= 200 && xhr.status < 300 ? labels.done : labels.failed;
-      resolve();
+      if (xhr.status >= 200 && xhr.status < 300) {
+        resolve(JSON.parse(xhr.responseText));
+      } else {
+        reject(new Error('chunk_failed'));
+      }
     });
-    xhr.addEventListener('error', function () {
-      pct.textContent = labels.failed;
-      resolve();
-    });
-    xhr.open('POST', '/upload');
+    xhr.addEventListener('error', function () { reject(new Error('chunk_failed')); });
+    xhr.open('POST', '/upload/chunk');
     xhr.setRequestHeader('X-Requested-With', 'LumenDropClient');
     xhr.send(fd);
+  });
+}
+
+function uploadFileChunked(file, bar, pctLabel, labels) {
+  var totalChunks = Math.max(1, Math.ceil(file.size / LUMENDROP_CHUNK_SIZE));
+
+  function updateProgress(doneCount) {
+    var pct = Math.round((doneCount / totalChunks) * 100);
+    bar.value = pct;
+    pctLabel.textContent = pct + '%';
+  }
+
+  function sendRemaining(uploadId, alreadyReceived) {
+    var receivedSet = {};
+    alreadyReceived.forEach(function (i) { receivedSet[i] = true; });
+    var doneCount = alreadyReceived.length;
+    updateProgress(doneCount);
+
+    function sendNext(index) {
+      if (index >= totalChunks) {
+        return fetch('/upload/complete/' + uploadId, {
+          method: 'POST', headers: {'X-Requested-With': 'LumenDropClient'},
+        }).then(function (r) {
+          if (!r.ok) throw new Error('complete_failed');
+          return r.json();
+        }).then(function () {
+          lumendropClearId(file);
+          pctLabel.textContent = labels.done;
+        });
+      }
+      if (receivedSet[index]) {
+        return sendNext(index + 1);
+      }
+      var start = index * LUMENDROP_CHUNK_SIZE;
+      var end = Math.min(file.size, start + LUMENDROP_CHUNK_SIZE);
+      return uploadChunkXhr(uploadId, index, file.slice(start, end)).then(function () {
+        doneCount += 1;
+        updateProgress(doneCount);
+        return sendNext(index + 1);
+      });
+    }
+
+    return sendNext(0);
+  }
+
+  function startFresh() {
+    return postJSON('/upload/init', {
+      filename: file.name, total_size: file.size, chunk_size: LUMENDROP_CHUNK_SIZE,
+    }).then(function (init) {
+      lumendropSaveId(file, init.upload_id);
+      return sendRemaining(init.upload_id, []);
+    });
+  }
+
+  var savedId = lumendropGetSavedId(file);
+  var flow = savedId
+    ? getJSON('/upload/status/' + savedId).then(function (status) {
+        return sendRemaining(savedId, status.received);
+      }).catch(function () {
+        lumendropClearId(file);
+        return startFresh();
+      })
+    : startFresh();
+
+  return flow.catch(function () {
+    pctLabel.textContent = labels.failed;
   });
 }
 
@@ -658,7 +1030,20 @@ function initUploader(labels) {
 
   function handleFiles(fileList) {
     var files = Array.prototype.slice.call(fileList);
-    Promise.all(files.map(function (f) { return uploadOne(f, progressList, labels); })).then(function () {
+    var uploads = files.map(function (file) {
+      var row = document.createElement('div');
+      row.className = 'upload-row';
+      var label = document.createElement('span');
+      label.textContent = file.name;
+      var bar = document.createElement('progress');
+      bar.max = 100; bar.value = 0;
+      var pct = document.createElement('span');
+      pct.textContent = '0%';
+      row.appendChild(label); row.appendChild(bar); row.appendChild(pct);
+      progressList.appendChild(row);
+      return uploadFileChunked(file, bar, pct, labels);
+    });
+    Promise.all(uploads).then(function () {
       setTimeout(function () { window.location.reload(); }, 600);
     });
   }
@@ -783,21 +1168,30 @@ class AppState:
     upload_dir: Path
     pin: str
     logger: logging.Logger
+    persistent_store: "PersistentSecurityStore" = None
     session_manager: SessionManager = field(default_factory=SessionManager)
     event_bus: SecurityEventBus = field(default_factory=SecurityEventBus)
     ban_store: BanStore = None
-    login_tracker: LoginAttemptTracker = field(default_factory=LoginAttemptTracker)
+    login_tracker: LoginAttemptTracker = None
     global_limiter: SlidingWindowLimiter = field(
         default_factory=lambda: SlidingWindowLimiter(GLOBAL_RATE_LIMIT_PER_MIN, 60)
     )
     login_limiter: SlidingWindowLimiter = field(default_factory=lambda: SlidingWindowLimiter(20, 60))
     metadata_store: MetadataStore = None
+    upload_session_store: UploadSessionStore = None
+    https_enabled: bool = False
 
     def __post_init__(self):
+        if self.persistent_store is None:
+            self.persistent_store = PersistentSecurityStore(app_data_dir() / "security.db")
         if self.ban_store is None:
-            self.ban_store = BanStore(self.event_bus, self.logger)
+            self.ban_store = BanStore(self.event_bus, self.logger, self.persistent_store)
+        if self.login_tracker is None:
+            self.login_tracker = LoginAttemptTracker(self.persistent_store)
         if self.metadata_store is None:
             self.metadata_store = MetadataStore(self.upload_dir)
+        if self.upload_session_store is None:
+            self.upload_session_store = UploadSessionStore(self.upload_dir)
 
 
 def client_ip(request: Request) -> str:
@@ -827,6 +1221,9 @@ class SecurityMiddleware(BaseHTTPMiddleware):
             state.logger.warning("Rate limit exceeded for %s", ip)
             return JSONResponse({"detail": "rate_limited"}, status_code=429)
 
+        trusted = state.persistent_store.is_trusted(ip)
+        margin = TRUSTED_REPUTATION_MARGIN if trusted else 0
+
         query_string = request.url.query or ""
         score, reasons = request_threat_score(request.url.path, query_string, [])
         if request.method in ("POST", "PUT", "PATCH"):
@@ -835,12 +1232,19 @@ class SecurityMiddleware(BaseHTTPMiddleware):
                 score += 3
                 reasons.append("origin_mismatch")
 
-        if score >= THREAT_SCORE_BAN_THRESHOLD:
+        if score >= THREAT_SCORE_BAN_THRESHOLD + margin:
             state.ban_store.ban(ip, ",".join(reasons) or "heuristic_threat_score", score)
             return JSONResponse({"detail": "forbidden"}, status_code=403)
         elif score > 0:
-            state.event_bus.publish(SecurityEvent(time.time(), ip, ",".join(reasons), score))
+            reason_str = ",".join(reasons)
+            state.persistent_store.record_event(ip, reason_str, score)
+            state.event_bus.publish(SecurityEvent(time.time(), ip, reason_str, score))
             state.logger.info("Elevated threat score %s for %s (%s)", score, ip, reasons)
+
+            cumulative = state.persistent_store.cumulative_score(ip, CUMULATIVE_THREAT_WINDOW_SECONDS)
+            if cumulative >= CUMULATIVE_THREAT_THRESHOLD + margin:
+                state.ban_store.ban(ip, f"cumulative_threat_score:{cumulative}", cumulative)
+                return JSONResponse({"detail": "forbidden"}, status_code=403)
 
         response = await call_next(request)
         response.headers["X-Content-Type-Options"] = "nosniff"
@@ -852,11 +1256,43 @@ class SecurityMiddleware(BaseHTTPMiddleware):
         )
         response.headers["Permissions-Policy"] = "geolocation=(), microphone=(), camera=()"
         response.headers["Cache-Control"] = "no-store"
+        if state.https_enabled:
+            response.headers["Strict-Transport-Security"] = "max-age=63072000; includeSubDomains"
         return response
 
 
 class AuthRequired(Exception):
     pass
+
+
+class UploadInitRequest(BaseModel):
+    filename: str = Field(min_length=1, max_length=MAX_FILENAME_LENGTH * 2)
+    total_size: int = Field(gt=0, le=MAX_UPLOAD_BYTES)
+    chunk_size: int = Field(
+        default=RESUMABLE_DEFAULT_CHUNK_SIZE, ge=RESUMABLE_MIN_CHUNK_SIZE, le=RESUMABLE_MAX_CHUNK_SIZE,
+    )
+
+
+def finalize_uploaded_file(state: AppState, ip: str, destination: Path, total_written: int) -> None:
+    classification = classify_upload(destination)
+    state.metadata_store.set(destination.name, {
+        "uploaded_at": time.time(),
+        "sha256": sha256_of_file(destination),
+        "quarantined": classification["quarantined"],
+        "heuristics": classification["reasons"],
+    })
+    if classification["quarantined"]:
+        state.logger.warning(
+            "Upload flagged for review from %s: %s (%s)",
+            ip, destination.name, classification["reasons"],
+        )
+        state.persistent_store.record_event(
+            ip, f"quarantined_upload:{destination.name}", classification["score"],
+        )
+        state.event_bus.publish(SecurityEvent(
+            time.time(), ip, f"quarantined_upload:{destination.name}", classification["score"],
+        ))
+    state.logger.info("Upload saved from %s: %s (%s)", ip, destination.name, human_size(total_written))
 
 
 def create_app(state: AppState) -> FastAPI:
@@ -897,7 +1333,10 @@ def create_app(state: AppState) -> FastAPI:
         referer = request.headers.get("referer", "/")
         destination = referer if request.base_url.hostname in referer else "/"
         response = RedirectResponse(destination, status_code=303)
-        response.set_cookie(LANG_COOKIE, code, max_age=60 * 60 * 24 * 365, samesite="strict", httponly=True)
+        response.set_cookie(
+            LANG_COOKIE, code, max_age=60 * 60 * 24 * 365, samesite="strict", httponly=True,
+            secure=state.https_enabled,
+        )
         return response
 
     @app.get("/login", response_class=HTMLResponse)
@@ -924,6 +1363,7 @@ def create_app(state: AppState) -> FastAPI:
             failures = state.login_tracker.register_failure(ip)
             state.logger.warning("Failed login attempt from %s (%s/%s)", ip, failures, MAX_LOGIN_ATTEMPTS)
             if failures >= MAX_LOGIN_ATTEMPTS:
+                state.persistent_store.record_event(ip, "login_bruteforce", failures)
                 state.event_bus.publish(SecurityEvent(time.time(), ip, "login_bruteforce", failures))
             return HTMLResponse(render_login_page(lang, STRINGS[lang]["login_error"]), status_code=401)
 
@@ -936,6 +1376,7 @@ def create_app(state: AppState) -> FastAPI:
             max_age=SESSION_MAX_AGE,
             httponly=True,
             samesite="strict",
+            secure=state.https_enabled,
         )
         return response
 
@@ -957,7 +1398,6 @@ def create_app(state: AppState) -> FastAPI:
 
     @app.post("/upload")
     async def upload(request: Request, files: list[UploadFile] = File(...), _: None = Depends(require_auth)):
-        lang = get_lang(request)
         ip = client_ip(request)
         saved = []
         for upload_file in files:
@@ -984,25 +1424,135 @@ def create_app(state: AppState) -> FastAPI:
                 state.logger.warning("Rejected oversized upload from %s: %s", ip, cleaned)
                 continue
 
-            classification = classify_upload(destination)
-            state.metadata_store.set(destination.name, {
-                "uploaded_at": time.time(),
-                "sha256": sha256_of_file(destination),
-                "quarantined": classification["quarantined"],
-                "heuristics": classification["reasons"],
-            })
-            if classification["quarantined"]:
-                state.logger.warning(
-                    "Upload flagged for review from %s: %s (%s)",
-                    ip, destination.name, classification["reasons"],
-                )
-                state.event_bus.publish(SecurityEvent(
-                    time.time(), ip, f"quarantined_upload:{destination.name}", classification["score"],
-                ))
-            state.logger.info("Upload saved from %s: %s (%s)", ip, destination.name, human_size(total_written))
+            finalize_uploaded_file(state, ip, destination, total_written)
             saved.append(destination.name)
 
         return JSONResponse({"ok": True, "saved": saved})
+
+    @app.post("/upload/init")
+    async def upload_init(payload: UploadInitRequest, request: Request, _: None = Depends(require_auth)):
+        state.upload_session_store.sweep_expired()
+        cleaned_name = safe_filename(payload.filename)
+        session = state.upload_session_store.create_session(cleaned_name, payload.total_size, payload.chunk_size)
+        state.logger.info(
+            "Upload session started by %s: %s (%s, %s chunk(s))",
+            client_ip(request), cleaned_name, human_size(payload.total_size), session["total_chunks"],
+        )
+        return JSONResponse({
+            "upload_id": session["upload_id"],
+            "chunk_size": session["chunk_size"],
+            "total_chunks": session["total_chunks"],
+        })
+
+    @app.get("/upload/status/{upload_id}")
+    async def upload_status(upload_id: str, request: Request, _: None = Depends(require_auth)):
+        session = state.upload_session_store.get_session(upload_id)
+        if session is None:
+            lang = get_lang(request)
+            return JSONResponse({"detail": STRINGS[lang]["not_found"]}, status_code=404)
+        return JSONResponse({
+            "received": session["received"],
+            "total_chunks": session["total_chunks"],
+            "chunk_size": session["chunk_size"],
+            "filename": session["filename"],
+        })
+
+    @app.post("/upload/chunk")
+    async def upload_chunk(
+        request: Request,
+        upload_id: str = Form(...),
+        chunk_index: int = Form(...),
+        chunk: UploadFile = File(...),
+        _: None = Depends(require_auth),
+    ):
+        lang = get_lang(request)
+        ip = client_ip(request)
+        session = state.upload_session_store.get_session(upload_id)
+        if session is None:
+            return JSONResponse({"detail": STRINGS[lang]["not_found"]}, status_code=404)
+
+        total_chunks = session["total_chunks"]
+        if chunk_index < 0 or chunk_index >= total_chunks:
+            return JSONResponse({"detail": STRINGS[lang]["invalid_request"]}, status_code=400)
+
+        max_allowed = min(session["chunk_size"], RESUMABLE_MAX_CHUNK_SIZE) + 1024
+        destination = state.upload_session_store.chunk_path(upload_id, chunk_index)
+        total_written = 0
+        aborted = False
+        try:
+            with destination.open("wb") as out:
+                while True:
+                    data = await chunk.read(UPLOAD_CHUNK_SIZE)
+                    if not data:
+                        break
+                    total_written += len(data)
+                    if total_written > max_allowed:
+                        aborted = True
+                        break
+                    out.write(data)
+        finally:
+            await chunk.close()
+
+        if aborted:
+            destination.unlink(missing_ok=True)
+            state.logger.warning("Rejected oversized chunk from %s for session %s", ip, upload_id)
+            return JSONResponse({"detail": STRINGS[lang]["file_too_large"]}, status_code=400)
+
+        updated = state.upload_session_store.mark_received(upload_id, chunk_index)
+        if updated is None:
+            destination.unlink(missing_ok=True)
+            return JSONResponse({"detail": STRINGS[lang]["not_found"]}, status_code=404)
+
+        complete = len(updated["received"]) >= updated["total_chunks"]
+        return JSONResponse({
+            "received_count": len(updated["received"]),
+            "total_chunks": updated["total_chunks"],
+            "complete": complete,
+        })
+
+    @app.post("/upload/complete/{upload_id}")
+    async def upload_complete(upload_id: str, request: Request, _: None = Depends(require_auth)):
+        lang = get_lang(request)
+        ip = client_ip(request)
+        session = state.upload_session_store.get_session(upload_id)
+        if session is None:
+            return JSONResponse({"detail": STRINGS[lang]["not_found"]}, status_code=404)
+
+        total_chunks = session["total_chunks"]
+        received = set(session["received"])
+        if received != set(range(total_chunks)):
+            return JSONResponse(
+                {"detail": "incomplete", "received": sorted(received), "total_chunks": total_chunks},
+                status_code=409,
+            )
+
+        destination = unique_destination(state.upload_dir, session["filename"])
+        total_written = 0
+        try:
+            with destination.open("wb") as out:
+                for index in range(total_chunks):
+                    part_path = state.upload_session_store.chunk_path(upload_id, index)
+                    with part_path.open("rb") as part:
+                        while True:
+                            block = part.read(UPLOAD_CHUNK_SIZE)
+                            if not block:
+                                break
+                            total_written += len(block)
+                            out.write(block)
+        except OSError:
+            destination.unlink(missing_ok=True)
+            state.upload_session_store.discard(upload_id)
+            return JSONResponse({"detail": STRINGS[lang]["server_error"]}, status_code=500)
+
+        if total_written != session["total_size"]:
+            destination.unlink(missing_ok=True)
+            state.upload_session_store.discard(upload_id)
+            state.logger.warning("Assembled size mismatch from %s for %s", ip, session["filename"])
+            return JSONResponse({"detail": STRINGS[lang]["server_error"]}, status_code=400)
+
+        finalize_uploaded_file(state, ip, destination, total_written)
+        state.upload_session_store.discard(upload_id)
+        return JSONResponse({"ok": True, "saved": destination.name})
 
     @app.get("/files/{name:path}")
     async def download(name: str, request: Request, _: None = Depends(require_auth)):
@@ -1059,14 +1609,119 @@ def generate_pin() -> str:
     return "".join(secrets.choice("0123456789") for _ in range(PIN_LENGTH))
 
 
+def _cert_not_valid_after(cert) -> datetime.datetime:
+    try:
+        return cert.not_valid_after_utc
+    except AttributeError:
+        return cert.not_valid_after.replace(tzinfo=datetime.timezone.utc)
+
+
+def _cert_covers_ip(cert, lan_ip: str) -> bool:
+    try:
+        san = cert.extensions.get_extension_for_class(x509.SubjectAlternativeName).value
+        covered_ips = {str(ip) for ip in san.get_values_for_type(x509.IPAddress)}
+    except x509.ExtensionNotFound:
+        return False
+    return lan_ip in covered_ips
+
+
+def _write_private_key_file(path: Path, data: bytes) -> None:
+    path.write_bytes(data)
+    try:
+        os.chmod(path, 0o600)
+    except OSError:
+        pass
+
+
+def _build_self_signed_certificate(lan_ip: str) -> tuple[bytes, bytes]:
+    key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    subject = issuer = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, APP_NAME)])
+
+    san_entries: list = [x509.DNSName("localhost"), x509.IPAddress(ipaddress.ip_address("127.0.0.1"))]
+    try:
+        ip_obj = ipaddress.ip_address(lan_ip)
+        if str(ip_obj) not in {"127.0.0.1"}:
+            san_entries.append(x509.IPAddress(ip_obj))
+    except ValueError:
+        san_entries.append(x509.DNSName(lan_ip))
+
+    now = datetime.datetime.now(datetime.timezone.utc)
+    cert = (
+        x509.CertificateBuilder()
+        .subject_name(subject)
+        .issuer_name(issuer)
+        .public_key(key.public_key())
+        .serial_number(x509.random_serial_number())
+        .not_valid_before(now - datetime.timedelta(days=1))
+        .not_valid_after(now + datetime.timedelta(days=CERT_VALIDITY_DAYS))
+        .add_extension(x509.SubjectAlternativeName(san_entries), critical=False)
+        .add_extension(x509.BasicConstraints(ca=False, path_length=None), critical=True)
+        .sign(key, crypto_hashes.SHA256())
+    )
+
+    key_bytes = key.private_bytes(
+        encoding=serialization.Encoding.PEM,
+        format=serialization.PrivateFormat.PKCS8,
+        encryption_algorithm=serialization.NoEncryption(),
+    )
+    cert_bytes = cert.public_bytes(serialization.Encoding.PEM)
+    return cert_bytes, key_bytes
+
+
+def ensure_certificate(cert_dir: Path, lan_ip: str, logger: logging.Logger) -> Optional[tuple]:
+    if not CRYPTOGRAPHY_AVAILABLE:
+        logger.warning("The 'cryptography' package is not installed; HTTPS is unavailable this run.")
+        return None
+
+    cert_dir.mkdir(parents=True, exist_ok=True)
+    cert_path = cert_dir / "cert.pem"
+    key_path = cert_dir / "key.pem"
+
+    needs_regeneration = not cert_path.exists() or not key_path.exists()
+    existing_cert = None
+    if not needs_regeneration:
+        try:
+            existing_cert = x509.load_pem_x509_certificate(cert_path.read_bytes())
+            if _cert_not_valid_after(existing_cert) <= datetime.datetime.now(datetime.timezone.utc):
+                needs_regeneration = True
+            elif not _cert_covers_ip(existing_cert, lan_ip):
+                needs_regeneration = True
+        except (ValueError, OSError):
+            needs_regeneration = True
+
+    if needs_regeneration:
+        logger.info("Generating a new self-signed TLS certificate for %s", lan_ip)
+        cert_bytes, key_bytes = _build_self_signed_certificate(lan_ip)
+        cert_path.write_bytes(cert_bytes)
+        _write_private_key_file(key_path, key_bytes)
+        existing_cert = x509.load_pem_x509_certificate(cert_bytes)
+
+    fingerprint = existing_cert.fingerprint(crypto_hashes.SHA256())
+    fingerprint_hex = ":".join(f"{b:02X}" for b in fingerprint)
+    return cert_path, key_path, fingerprint_hex
+
+
 class ServerController:
-    def __init__(self, upload_dir: Path, host: str, port: int, pin: str, logger: logging.Logger):
+    def __init__(
+        self,
+        upload_dir: Path,
+        host: str,
+        port: int,
+        pin: str,
+        logger: logging.Logger,
+        cert_path: Optional[Path] = None,
+        key_path: Optional[Path] = None,
+    ):
         self.upload_dir = upload_dir
         self.host = host
         self.port = port
         self.pin = pin
         self.logger = logger
-        self.state = AppState(upload_dir=upload_dir, pin=pin, logger=logger)
+        self.cert_path = cert_path
+        self.key_path = key_path
+        self.state = AppState(
+            upload_dir=upload_dir, pin=pin, logger=logger, https_enabled=cert_path is not None,
+        )
         self.app = create_app(self.state)
         self._server: Optional[uvicorn.Server] = None
         self._thread: Optional[threading.Thread] = None
@@ -1078,9 +1733,11 @@ class ServerController:
     def start(self) -> None:
         if self.running:
             return
-        config = uvicorn.Config(
-            self.app, host=self.host, port=self.port, log_level="warning", access_log=False,
-        )
+        config_kwargs = dict(host=self.host, port=self.port, log_level="warning", access_log=False)
+        if self.cert_path is not None and self.key_path is not None:
+            config_kwargs["ssl_certfile"] = str(self.cert_path)
+            config_kwargs["ssl_keyfile"] = str(self.key_path)
+        config = uvicorn.Config(self.app, **config_kwargs)
         self._server = uvicorn.Server(config)
 
         def _run():
@@ -1099,9 +1756,14 @@ class ServerController:
             self._thread.join(timeout=5)
         self._thread = None
         self._server = None
+        if self.state.persistent_store is not None:
+            self.state.persistent_store.close()
 
 
-def build_gui(initial_dir: Path, initial_port: int, allow_root: bool, gui_logger: logging.Logger, gui_queue) -> None:
+def build_gui(
+    initial_dir: Path, initial_port: int, allow_root: bool, use_https: bool,
+    gui_logger: logging.Logger, gui_queue,
+) -> None:
     import tkinter as tk
     from tkinter import filedialog, messagebox
     from tkinter.scrolledtext import ScrolledText
@@ -1113,6 +1775,7 @@ def build_gui(initial_dir: Path, initial_port: int, allow_root: bool, gui_logger
         def __init__(self):
             self.lang = "en"
             self.upload_dir = initial_dir
+            self.use_https = use_https
             self.controller: Optional[ServerController] = None
             self.event_queue = None
             self.log_queue = gui_queue
@@ -1120,13 +1783,14 @@ def build_gui(initial_dir: Path, initial_port: int, allow_root: bool, gui_logger
 
             self.root = ttk.Window(themename="darkly")
             self.root.title(GUI_STRINGS[self.lang]["window_title"])
-            self.root.geometry("760x620")
+            self.root.geometry("760x680")
             self.root.protocol("WM_DELETE_WINDOW", self.on_close)
 
             self.folder_var = tk.StringVar(value=str(initial_dir))
             self.port_var = tk.IntVar(value=initial_port)
             self.host_var = tk.StringVar(value="")
             self.pin_var = tk.StringVar(value="------")
+            self.fingerprint_var = tk.StringVar(value="")
             self.status_var = tk.StringVar(value=GUI_STRINGS[self.lang]["status_stopped"])
             self.lang_var = tk.StringVar(value="English")
 
@@ -1202,8 +1866,14 @@ def build_gui(initial_dir: Path, initial_port: int, allow_root: bool, gui_logger
             self.qr_hint_label = ttk.Label(frame, text=self.t("qr_hint"))
             self.qr_hint_label.grid(row=5, column=0, columnspan=2, sticky=W)
 
+            self.fingerprint_label = ttk.Label(frame, text=self.t("fingerprint_label"))
+            self.fingerprint_label.grid(row=6, column=0, sticky=W, pady=6)
+            ttk.Label(
+                frame, textvariable=self.fingerprint_var, font=("TkDefaultFont", 9),
+            ).grid(row=6, column=1, columnspan=2, sticky=W, padx=6)
+
             button_row = ttk.Frame(frame)
-            button_row.grid(row=6, column=0, columnspan=3, pady=16, sticky=W)
+            button_row.grid(row=7, column=0, columnspan=3, pady=16, sticky=W)
             self.start_button = ttk.Button(button_row, text=self.t("start"), command=self.on_start, bootstyle="success")
             self.start_button.pack(side=LEFT, padx=(0, 8))
             self.stop_button = ttk.Button(
@@ -1212,10 +1882,13 @@ def build_gui(initial_dir: Path, initial_port: int, allow_root: bool, gui_logger
             self.stop_button.pack(side=LEFT)
 
             self.status_label = ttk.Label(frame, textvariable=self.status_var, font=("TkDefaultFont", 10, "italic"))
-            self.status_label.grid(row=7, column=0, columnspan=3, sticky=W, pady=(6, 0))
+            self.status_label.grid(row=8, column=0, columnspan=3, sticky=W, pady=(6, 0))
 
             self.root_warning_label = ttk.Label(frame, text="", bootstyle="danger", wraplength=680)
-            self.root_warning_label.grid(row=8, column=0, columnspan=3, sticky=W, pady=(10, 0))
+            self.root_warning_label.grid(row=9, column=0, columnspan=3, sticky=W, pady=(10, 0))
+
+            self.https_warning_label = ttk.Label(frame, text="", bootstyle="warning", wraplength=680)
+            self.https_warning_label.grid(row=10, column=0, columnspan=3, sticky=W, pady=(4, 0))
 
         def _build_security_tab(self) -> None:
             frame = self.tab_security
@@ -1270,6 +1943,9 @@ def build_gui(initial_dir: Path, initial_port: int, allow_root: bool, gui_logger
             self.pin_label.configure(text=g["pin_label"])
             self.copy_pin_button.configure(text=g["copy_pin"])
             self.qr_hint_label.configure(text=g["qr_hint"])
+            self.fingerprint_label.configure(text=g["fingerprint_label"])
+            if self.https_warning_label.cget("text"):
+                self.https_warning_label.configure(text=g["https_unavailable"])
             self.start_button.configure(text=g["start"])
             self.stop_button.configure(text=g["stop"])
             running = self.controller is not None and self.controller.running
@@ -1318,18 +1994,34 @@ def build_gui(initial_dir: Path, initial_port: int, allow_root: bool, gui_logger
                 return
 
             pin = generate_pin()
+            lan_ip = detect_lan_ip()
+
+            cert_path = key_path = None
+            fingerprint = None
+            if self.use_https:
+                cert_info = ensure_certificate(app_data_dir() / "tls", lan_ip, gui_logger)
+                if cert_info is not None:
+                    cert_path, key_path, fingerprint = cert_info
+
+            scheme = "https" if cert_path is not None else "http"
+            if self.use_https and cert_path is None:
+                self.https_warning_label.configure(text=g["https_unavailable"])
+            else:
+                self.https_warning_label.configure(text="")
+
             self.controller = ServerController(
                 upload_dir=folder, host="0.0.0.0", port=self.port_var.get(), pin=pin, logger=gui_logger,
+                cert_path=cert_path, key_path=key_path,
             )
             self.event_queue = self.controller.state.event_bus.subscribe()
             self.status_var.set(g["status_starting"])
             self.root.update_idletasks()
             self.controller.start()
 
-            lan_ip = detect_lan_ip()
-            url = f"http://{lan_ip}:{self.port_var.get()}/"
+            url = f"{scheme}://{lan_ip}:{self.port_var.get()}/"
             self.host_var.set(url)
             self.pin_var.set(pin)
+            self.fingerprint_var.set(fingerprint if fingerprint else "-")
             qr_image = generate_qr_image(url).resize((180, 180))
             self.qr_photo = ImageTk.PhotoImage(qr_image)
             self.qr_label.configure(image=self.qr_photo)
@@ -1367,13 +2059,11 @@ def build_gui(initial_dir: Path, initial_port: int, allow_root: bool, gui_logger
                 self.banned_tree.insert("", "end", values=(ip, when))
 
         def poll_queues(self) -> None:
-            drained = False
             while True:
                 try:
                     line = self.log_queue.get_nowait()
                 except queue.Empty:
                     break
-                drained = True
                 self.log_text.configure(state="normal")
                 self.log_text.insert("end", line + "\n")
                 self.log_text.configure(state="disabled")
@@ -1410,19 +2100,36 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--port", type=int, default=DEFAULT_PORT)
     parser.add_argument("--allow-root", action="store_true")
     parser.add_argument("--no-gui", action="store_true")
+    parser.add_argument("--no-https", action="store_true")
     return parser.parse_args(argv)
 
 
-def run_headless(folder: Path, port: int, logger: logging.Logger) -> None:
+def run_headless(folder: Path, port: int, use_https: bool, logger: logging.Logger) -> None:
     folder.mkdir(parents=True, exist_ok=True)
     pin = generate_pin()
-    controller = ServerController(upload_dir=folder, host="0.0.0.0", port=port, pin=pin, logger=logger)
     lan_ip = detect_lan_ip()
-    url = f"http://{lan_ip}:{port}/"
+
+    cert_path = key_path = None
+    fingerprint = None
+    if use_https:
+        cert_info = ensure_certificate(app_data_dir() / "tls", lan_ip, logger)
+        if cert_info is not None:
+            cert_path, key_path, fingerprint = cert_info
+
+    scheme = "https" if cert_path is not None else "http"
+    controller = ServerController(
+        upload_dir=folder, host="0.0.0.0", port=port, pin=pin, logger=logger,
+        cert_path=cert_path, key_path=key_path,
+    )
+    url = f"{scheme}://{lan_ip}:{port}/"
     print(f"{APP_NAME} {APP_VERSION}")
     print(f"Folder: {folder}")
     print(f"URL:    {url}")
     print(f"PIN:    {pin}")
+    if fingerprint is not None:
+        print(f"TLS certificate fingerprint (SHA-256): {fingerprint}")
+    elif use_https:
+        print("HTTPS unavailable this run; serving over plain HTTP. See the log for why.")
     controller.start()
     try:
         while controller.running:
@@ -1447,10 +2154,10 @@ def main() -> None:
     folder = Path(args.folder).expanduser()
 
     if args.no_gui:
-        run_headless(folder, args.port, logger)
+        run_headless(folder, args.port, not args.no_https, logger)
         return
 
-    build_gui(folder, args.port, args.allow_root, logger, gui_queue)
+    build_gui(folder, args.port, args.allow_root, not args.no_https, logger, gui_queue)
 
 if __name__ == "__main__":
     main()
