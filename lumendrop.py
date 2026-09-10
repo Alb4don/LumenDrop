@@ -29,7 +29,7 @@ from typing import Optional
 import qrcode
 import uvicorn
 from fastapi import Depends, FastAPI, File, Form, Request, UploadFile
-from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse, Response
 from itsdangerous import BadSignature, URLSafeTimedSerializer
 from pydantic import BaseModel, Field
 from starlette.middleware.base import BaseHTTPMiddleware
@@ -46,7 +46,7 @@ except ImportError:
     CRYPTOGRAPHY_AVAILABLE = False
 
 APP_NAME = "LumenDrop"
-APP_VERSION = "1.1.0"
+APP_VERSION = "1.2.0"
 DEFAULT_PORT = 8420
 SESSION_COOKIE = "lumendrop_session"
 LANG_COOKIE = "lumendrop_lang"
@@ -157,6 +157,7 @@ STRINGS = {
 GUI_STRINGS = {
     "en": {
         "window_title": "LumenDrop Control Panel",
+        "window_title_ver": "LumenDrop Control Panel  ·  v{version}",
         "tab_server": "Server",
         "tab_security": "Security",
         "tab_logs": "Logs",
@@ -194,6 +195,7 @@ GUI_STRINGS = {
     },
     "pt": {
         "window_title": "Painel de Controle do LumenDrop",
+        "window_title_ver": "Painel de Controle do LumenDrop  ·  v{version}",
         "tab_server": "Servidor",
         "tab_security": "Seguran\u00e7a",
         "tab_logs": "Registros",
@@ -334,6 +336,10 @@ def resolve_upload_path(upload_dir: Path, raw_name: str) -> Optional[Path]:
     if not candidate.is_file():
         return None
     return candidate
+
+
+def is_valid_upload_id(upload_id: str) -> bool:
+    return bool(re.fullmatch(r"[A-Za-z0-9_-]{16,64}", upload_id or ""))
 
 
 def human_size(num_bytes: int) -> str:
@@ -819,53 +825,66 @@ class UploadSessionStore:
 
 APP_CSS = """
 :root {
-  --bg: #0f1720; --panel: #17212b; --accent: #4da3ff; --accent-2: #37e6b0;
-  --text: #e7edf3; --muted: #93a4b8; --danger: #ff6b6b; --border: #26333f;
+  --bg: #0b1220; --panel: #15202b; --accent: #4da3ff; --accent-2: #37e6b0;
+  --text: #e8eef5; --muted: #8fa3b8; --danger: #ff6b6b; --border: #243041;
+  --shadow: 0 8px 24px rgba(0,0,0,0.35);
   font-family: -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
 }
 * { box-sizing: border-box; }
 body { margin: 0; background: var(--bg); color: var(--text); min-height: 100vh; }
-.container { max-width: 780px; margin: 0 auto; padding: 24px 16px 80px; }
-.topbar { display: flex; justify-content: space-between; align-items: center; margin-bottom: 20px; }
-.topbar a { color: var(--muted); text-decoration: none; font-size: 14px; }
-h1 { font-size: 22px; margin: 0; }
-.card { background: var(--panel); border: 1px solid var(--border); border-radius: 14px; padding: 20px; }
+.container { max-width: 820px; margin: 0 auto; padding: 28px 18px 96px; }
+.topbar { display: flex; justify-content: space-between; align-items: center; margin-bottom: 22px; }
+.topbar a { color: var(--muted); text-decoration: none; font-size: 14px; transition: color .15s; }
+.topbar a:hover { color: var(--accent); }
+h1 { font-size: 24px; margin: 0; letter-spacing: -0.02em; }
+.card { background: var(--panel); border: 1px solid var(--border); border-radius: 16px; padding: 22px; box-shadow: var(--shadow); }
 .dropzone {
-  border: 2px dashed var(--border); border-radius: 14px; padding: 40px 20px;
-  text-align: center; color: var(--muted); cursor: pointer; margin-bottom: 24px;
-  transition: border-color .15s, background .15s;
+  border: 2px dashed var(--border); border-radius: 16px; padding: 48px 22px;
+  text-align: center; color: var(--muted); cursor: pointer; margin-bottom: 26px;
+  transition: border-color .2s, background .2s, transform .15s;
+  background: rgba(21,32,43,0.6);
 }
-.dropzone.dragover { border-color: var(--accent); background: rgba(77,163,255,0.08); color: var(--text); }
-.upload-row { display: flex; align-items: center; gap: 10px; padding: 8px 0; font-size: 13px; }
-.upload-row progress { flex: 1; height: 8px; }
-.gallery-heading { font-size: 16px; color: var(--muted); margin: 24px 0 12px; text-transform: uppercase; letter-spacing: .04em; }
-.file-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 14px; }
-.file-card { background: var(--panel); border: 1px solid var(--border); border-radius: 12px; overflow: hidden; }
-.file-thumb { width: 100%; height: 100px; object-fit: cover; display: block; background: #0c141c; }
-.file-icon { width: 100%; height: 100px; display: flex; align-items: center; justify-content: center; font-size: 34px; background: #0c141c; }
-.file-body { padding: 10px; }
-.file-name { font-size: 13px; word-break: break-word; margin-bottom: 4px; }
-.file-meta { font-size: 11px; color: var(--muted); margin-bottom: 8px; }
-.badge-quarantine { display: inline-block; font-size: 10px; color: var(--danger); border: 1px solid var(--danger); border-radius: 6px; padding: 2px 6px; margin-bottom: 6px; }
-.file-actions { display: flex; gap: 6px; }
+.dropzone:hover { border-color: var(--accent); color: var(--text); }
+.dropzone.dragover { border-color: var(--accent); background: rgba(77,163,255,0.1); color: var(--text); transform: scale(1.01); }
+.upload-row { display: flex; align-items: center; gap: 12px; padding: 10px 0; font-size: 13px; }
+.upload-row progress { flex: 1; height: 10px; border-radius: 6px; overflow: hidden; }
+.gallery-heading { font-size: 13px; color: var(--muted); margin: 28px 0 14px; text-transform: uppercase; letter-spacing: .06em; font-weight: 600; }
+.file-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(158px, 1fr)); gap: 16px; }
+.file-card { background: var(--panel); border: 1px solid var(--border); border-radius: 14px; overflow: hidden; transition: border-color .15s, box-shadow .15s; }
+.file-card:hover { border-color: #3a4d63; box-shadow: var(--shadow); }
+.file-thumb { width: 100%; height: 110px; object-fit: cover; display: block; background: #0a111a; }
+.file-icon { width: 100%; height: 110px; display: flex; align-items: center; justify-content: center; font-size: 36px; background: #0a111a; }
+.file-body { padding: 12px; }
+.file-name { font-size: 13px; word-break: break-word; margin-bottom: 4px; font-weight: 500; }
+.file-meta { font-size: 11px; color: var(--muted); margin-bottom: 10px; }
+.badge-quarantine { display: inline-block; font-size: 10px; color: var(--danger); border: 1px solid var(--danger); border-radius: 6px; padding: 2px 7px; margin-bottom: 8px; }
+.file-actions { display: flex; gap: 8px; }
 .file-actions a, .file-actions button {
-  flex: 1; text-align: center; text-decoration: none; font-size: 12px; padding: 6px 4px;
-  border-radius: 8px; border: 1px solid var(--border); background: #0c141c; color: var(--text); cursor: pointer;
+  flex: 1; text-align: center; text-decoration: none; font-size: 12px; padding: 7px 4px;
+  border-radius: 9px; border: 1px solid var(--border); background: #0c141c; color: var(--text); cursor: pointer;
+  transition: background .15s, border-color .15s;
 }
+.file-actions a:hover, .file-actions button:hover { background: #152233; border-color: #3a4d63; }
 .file-actions button.delete { color: var(--danger); }
-.empty-state { color: var(--muted); text-align: center; padding: 30px 0; }
+.file-actions button.delete:hover { background: rgba(255,107,107,0.12); }
+.empty-state { color: var(--muted); text-align: center; padding: 40px 0; font-size: 15px; }
 .login-wrap { display: flex; min-height: 90vh; align-items: center; justify-content: center; }
-.login-card { width: 100%; max-width: 320px; text-align: center; }
+.login-card { width: 100%; max-width: 340px; text-align: center; }
 .login-card input {
-  width: 100%; font-size: 24px; letter-spacing: 8px; text-align: center; padding: 12px;
-  border-radius: 10px; border: 1px solid var(--border); background: #0c141c; color: var(--text); margin: 16px 0;
+  width: 100%; font-size: 26px; letter-spacing: 10px; text-align: center; padding: 14px;
+  border-radius: 12px; border: 1px solid var(--border); background: #0c141c; color: var(--text); margin: 18px 0;
+  transition: border-color .15s, box-shadow .15s;
 }
+.login-card input:focus { outline: none; border-color: var(--accent); box-shadow: 0 0 0 3px rgba(77,163,255,0.25); }
 .login-card button {
-  width: 100%; padding: 12px; border-radius: 10px; border: none; background: var(--accent);
-  color: #04121f; font-weight: 600; cursor: pointer; font-size: 15px;
+  width: 100%; padding: 14px; border-radius: 12px; border: none; background: var(--accent);
+  color: #04121f; font-weight: 600; cursor: pointer; font-size: 15px; transition: filter .15s, transform .1s;
 }
-.error-text { color: var(--danger); font-size: 13px; min-height: 18px; margin-top: 8px; }
-.lang-switch a { color: var(--muted); margin-left: 10px; font-size: 12px; text-decoration: none; border-bottom: 1px dotted var(--muted); }
+.login-card button:hover { filter: brightness(1.08); }
+.login-card button:active { transform: scale(0.98); }
+.error-text { color: var(--danger); font-size: 13px; min-height: 18px; margin-top: 10px; }
+.lang-switch a { color: var(--muted); margin-left: 10px; font-size: 12px; text-decoration: none; border-bottom: 1px dotted var(--muted); transition: color .15s; }
+.lang-switch a:hover { color: var(--text); }
 .lang-switch a.active { color: var(--accent-2); border-color: var(--accent-2); }
 """
 
@@ -1049,10 +1068,20 @@ function initUploader(labels) {
   }
 }
 
-function confirmDelete(formEl, message) {
-  if (window.confirm(message)) formEl.submit();
-  return false;
-}
+document.addEventListener('DOMContentLoaded', function () {
+  var cfg = document.getElementById('uploader-config');
+  if (cfg) {
+    initUploader({done: cfg.dataset.done || 'Done', failed: cfg.dataset.failed || 'Failed'});
+  }
+  document.querySelectorAll('form.delete-form').forEach(function (form) {
+    form.addEventListener('submit', function (e) {
+      var msg = form.getAttribute('data-confirm') || 'Delete this file?';
+      if (!window.confirm(msg)) {
+        e.preventDefault();
+      }
+    });
+  });
+});
 """
 
 
@@ -1107,6 +1136,7 @@ def render_file_card(f: Path, lang: str, metadata: dict) -> str:
         thumb_html = '<div class="file-icon">&#128196;</div>'
     quarantined = metadata.get("quarantined", False)
     badge_html = f'<div class="badge-quarantine">{html.escape(t["quarantine_badge"])}</div>' if quarantined else ""
+    confirm_msg = html.escape(t["delete_confirm"])
     return f"""<div class="file-card">
   {thumb_html}
   <div class="file-body">
@@ -1114,8 +1144,8 @@ def render_file_card(f: Path, lang: str, metadata: dict) -> str:
     <div class="file-name">{name_escaped}</div>
     <div class="file-meta">{size_text} &middot; {when_text}</div>
     <div class="file-actions">
-      <a href="/files/{name_quoted}">{html.escape(t['download'])}</a>
-      <form method="post" action="/files/{name_quoted}/delete" onsubmit="return confirmDelete(this, {json.dumps(t['delete_confirm'])});">
+      <a href="/files/{name_quoted}?download=1">{html.escape(t['download'])}</a>
+      <form method="post" action="/files/{name_quoted}/delete" class="delete-form" data-confirm="{confirm_msg}">
         <button type="submit" class="delete">{html.escape(t['delete'])}</button>
       </form>
     </div>
@@ -1134,6 +1164,8 @@ def render_gallery(files: list[Path], lang: str, metadata_store: MetadataStore) 
 def render_main_page(lang: str, files: list[Path], metadata_store: MetadataStore) -> str:
     t = STRINGS[lang]
     gallery_html = render_gallery(files, lang, metadata_store)
+    done_esc = html.escape(t["done"])
+    failed_esc = html.escape(t["failed"])
     return f"""<!doctype html>
 <html lang="{lang}">
 <head>
@@ -1155,10 +1187,8 @@ def render_main_page(lang: str, files: list[Path], metadata_store: MetadataStore
   <div class="gallery-heading">{html.escape(t['gallery_heading'])}</div>
   {gallery_html}
 </div>
+<div id="uploader-config" data-done="{done_esc}" data-failed="{failed_esc}" hidden></div>
 <script src="/assets/app.js"></script>
-<script>
-initUploader({{done: {json.dumps(t['done'])}, failed: {json.dumps(t['failed'])}}});
-</script>
 </body>
 </html>"""
 
@@ -1446,9 +1476,11 @@ def create_app(state: AppState) -> FastAPI:
 
     @app.get("/upload/status/{upload_id}")
     async def upload_status(upload_id: str, request: Request, _: None = Depends(require_auth)):
+        lang = get_lang(request)
+        if not is_valid_upload_id(upload_id):
+            return JSONResponse({"detail": STRINGS[lang]["invalid_request"]}, status_code=400)
         session = state.upload_session_store.get_session(upload_id)
         if session is None:
-            lang = get_lang(request)
             return JSONResponse({"detail": STRINGS[lang]["not_found"]}, status_code=404)
         return JSONResponse({
             "received": session["received"],
@@ -1467,6 +1499,8 @@ def create_app(state: AppState) -> FastAPI:
     ):
         lang = get_lang(request)
         ip = client_ip(request)
+        if not is_valid_upload_id(upload_id):
+            return JSONResponse({"detail": STRINGS[lang]["invalid_request"]}, status_code=400)
         session = state.upload_session_store.get_session(upload_id)
         if session is None:
             return JSONResponse({"detail": STRINGS[lang]["not_found"]}, status_code=404)
@@ -1514,6 +1548,8 @@ def create_app(state: AppState) -> FastAPI:
     async def upload_complete(upload_id: str, request: Request, _: None = Depends(require_auth)):
         lang = get_lang(request)
         ip = client_ip(request)
+        if not is_valid_upload_id(upload_id):
+            return JSONResponse({"detail": STRINGS[lang]["invalid_request"]}, status_code=400)
         session = state.upload_session_store.get_session(upload_id)
         if session is None:
             return JSONResponse({"detail": STRINGS[lang]["not_found"]}, status_code=404)
@@ -1561,8 +1597,16 @@ def create_app(state: AppState) -> FastAPI:
             lang = get_lang(request)
             return JSONResponse({"detail": STRINGS[lang]["not_found"]}, status_code=404)
         media_type = mimetypes.guess_type(target.name)[0] or "application/octet-stream"
-        headers = {"Content-Disposition": f'attachment; filename="{target.name}"'}
-        return Response(target.read_bytes(), media_type=media_type, headers=headers)
+        ext = target.suffix.lower()
+        force_download = request.query_params.get("download") is not None
+        is_image = ext in IMAGE_EXTENSIONS
+        content_disposition_type = "attachment" if force_download or not is_image else "inline"
+        return FileResponse(
+            path=target,
+            media_type=media_type,
+            filename=target.name,
+            content_disposition_type=content_disposition_type,
+        )
 
     @app.post("/files/{name:path}/delete")
     async def delete_file(name: str, request: Request, _: None = Depends(require_auth)):
@@ -1730,9 +1774,9 @@ class ServerController:
     def running(self) -> bool:
         return self._thread is not None and self._thread.is_alive()
 
-    def start(self) -> None:
+    def start(self) -> bool:
         if self.running:
-            return
+            return True
         config_kwargs = dict(host=self.host, port=self.port, log_level="warning", access_log=False)
         if self.cert_path is not None and self.key_path is not None:
             config_kwargs["ssl_certfile"] = str(self.cert_path)
@@ -1741,13 +1785,24 @@ class ServerController:
         self._server = uvicorn.Server(config)
 
         def _run():
-            self._server.run()
+            try:
+                self._server.run()
+            except Exception as exc:
+                self.logger.exception("Server thread exited with error: %s", exc)
 
         self._thread = threading.Thread(target=_run, daemon=True)
         self._thread.start()
-        deadline = time.time() + 5
+        deadline = time.time() + 8
         while time.time() < deadline and not getattr(self._server, "started", False):
+            if not self._thread.is_alive():
+                break
             time.sleep(0.05)
+        if not getattr(self._server, "started", False):
+            self.logger.error("Server failed to start on %s:%s", self.host, self.port)
+            self._thread = None
+            self._server = None
+            return False
+        return True
 
     def stop(self) -> None:
         if self._server is not None:
@@ -1782,8 +1837,9 @@ def build_gui(
             self.qr_photo = None
 
             self.root = ttk.Window(themename="darkly")
-            self.root.title(GUI_STRINGS[self.lang]["window_title"])
-            self.root.geometry("760x680")
+            self.root.title(GUI_STRINGS[self.lang]["window_title_ver"].format(version=APP_VERSION))
+            self.root.geometry("800x720")
+            self.root.minsize(700, 600)
             self.root.protocol("WM_DELETE_WINDOW", self.on_close)
 
             self.folder_var = tk.StringVar(value=str(initial_dir))
@@ -1929,7 +1985,7 @@ def build_gui(
 
         def refresh_texts(self) -> None:
             g = GUI_STRINGS[self.lang]
-            self.root.title(g["window_title"])
+            self.root.title(g["window_title_ver"].format(version=APP_VERSION))
             self.title_label.configure(text=g["window_title"])
             self.lang_label.configure(text=g["language_label"])
             self.notebook.tab(self.tab_server, text=g["tab_server"])
@@ -2016,7 +2072,15 @@ def build_gui(
             self.event_queue = self.controller.state.event_bus.subscribe()
             self.status_var.set(g["status_starting"])
             self.root.update_idletasks()
-            self.controller.start()
+            if not self.controller.start():
+                self.status_var.set(g["status_stopped"])
+                messagebox.showerror(
+                    g["window_title"],
+                    f"Failed to start server on port {self.port_var.get()}. Port may be in use or permission denied.",
+                )
+                self.controller = None
+                self.event_queue = None
+                return
 
             url = f"{scheme}://{lan_ip}:{self.port_var.get()}/"
             self.host_var.set(url)
@@ -2130,7 +2194,9 @@ def run_headless(folder: Path, port: int, use_https: bool, logger: logging.Logge
         print(f"TLS certificate fingerprint (SHA-256): {fingerprint}")
     elif use_https:
         print("HTTPS unavailable this run; serving over plain HTTP. See the log for why.")
-    controller.start()
+    if not controller.start():
+        print("Failed to start server. Port may be in use or permission denied.", file=sys.stderr)
+        sys.exit(1)
     try:
         while controller.running:
             time.sleep(0.5)
