@@ -1,0 +1,38 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "lumendrop"
+version = "2.0.0"
+description = "Secure offline-first LAN file sharing with a web client and desktop control panel"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "Proprietary" }
+dependencies = [
+    "fastapi>=0.110",
+    "uvicorn[standard]>=0.30",
+    "python-multipart>=0.0.9",
+    "anyio>=4.0",
+    "qrcode>=7.4",
+    "pillow>=10.3",
+    "cryptography>=42.0",
+    "psutil>=5.9",
+]
+
+[project.optional-dependencies]
+gui = ["ttkbootstrap>=1.10"]
+dev = ["pytest>=8.0", "httpx>=0.27"]
+
+[project.scripts]
+lumendrop = "lumendrop.cli:main"
+
+[tool.setuptools]
+packages = ["lumendrop", "lumendrop.security", "lumendrop.storage", "lumendrop.web"]
+
+[tool.setuptools.package-data]
+"lumendrop.web" = ["static/*.css", "static/*.js", "static/*.svg"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["tests"]
